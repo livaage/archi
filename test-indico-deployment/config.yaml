@@ -1,0 +1,215 @@
+# Complete Indico Test Deployment Configuration
+# Deploy with: archi create indico-test --config-dir test-indico-deployment --sources indico --services chatbot
+
+name: indico-test
+
+deployment:
+  name: indico-test
+  description: "Test deployment for Indico event scraping with slide conversion"
+
+data_manager:
+  sources:
+    # === INDICO SOURCE (NEW!) ===
+    indico:
+      enabled: true
+      visible: true
+      schedule: ''  # Leave empty for manual collection
+      base_url: https://indico.cern.ch
+      use_sso: false  # Set to true if scraping protected events
+      sso_kwargs:
+        headless: true
+        site_type: generic
+      slide_conversion:
+        enabled: false  # Disabled until markitdown is added to base image
+        store_originals: false  # Only store markdown
+        formats:
+          - pdf
+          - pptx
+          - ppt
+          - odp
+        llm_enabled: false  # Future: LLM-based image descriptions
+        llm_model: null
+      plot_extraction:
+        enabled: false  # Future: plot extraction from slides
+    
+    # === OTHER SOURCES (NEEDED FOR INDICO) ===
+    links:
+      enabled: true
+      base_source_depth: 1
+      max_pages: null
+      visible: false
+      schedule: ''
+      input_lists:
+        - indico_events.list
+      html_scraper:
+        reset_data: true
+        verify_urls: false
+        enable_warnings: false
+      selenium_scraper:
+        enabled: false
+    
+    git:
+      enabled: false
+      visible: false
+      schedule: ''
+    
+    sso:
+      enabled: false
+      visible: false
+      schedule: ''
+    
+    jira:
+      enabled: false
+      visible: false
+      schedule: ''
+      url: ''
+      projects: []
+      anonymize_data: false
+      max_tickets: 10000000000
+      cutoff_date: ''
+    
+    redmine:
+      enabled: false
+      visible: false
+      schedule: ''
+      url: ''
+      project: ''
+  
+  # === VECTOR STORE CONFIGURATION ===
+  vectorstore:
+    provider: chroma  # or 'postgres' if you prefer
+    reset_store: true  # Fresh start for testing
+    model_name: sentence-transformers/all-MiniLM-L6-v2
+    model_kwargs:
+      device: cpu
+    encode_kwargs:
+      normalize_embeddings: true
+    chunk_size: 1000
+    chunk_overlap: 200
+    enable_stemming: false
+    distance_metric: cosine
+
+# === SERVICES CONFIGURATION ===
+services:
+  # Chat Interface (for testing RAG with Indico data)
+  chatbot:
+    enabled: true
+    external_port: 5000
+    host: 0.0.0.0
+    port: 5000
+    active_pipeline: conversational_rag
+    available_pipelines:
+      - conversational_rag
+      - simple_rag
+    
+    # Models
+    active_model: gpt-4o-mini  # Change to your preferred model
+    available_models:
+      - gpt-4o-mini
+      - gpt-4o
+      - gpt-4-turbo
+    
+    # Generation parameters
+    temperature: 0.7
+    max_tokens: 2048
+    top_p: 0.95
+    top_k: 40
+    
+    # Retrieval
+    num_documents_to_retrieve: 5
+    
+    # Prompts
+    active_condense_prompt: default
+    active_chat_prompt: default
+    active_system_prompt: default
+    
+    # Features
+    enable_conversation_history: true
+    max_history_length: 10
+    enable_sources_display: true
+    enable_feedback: true
+    
+    # Security
+    require_login: false  # Set to true for production
+    allowed_domains: []
+    
+    verbosity: info
+
+  # Data Manager (required for ingestion)
+  data_manager:
+    enabled: true
+    port: 8001
+    schedule_enabled: false  # Disable scheduled runs for testing
+
+  # Uploader (optional - for adding documents via UI)
+  uploader:
+    enabled: false
+    external_port: 5001
+
+  # Other services (disabled for this test)
+  piazza:
+    enabled: false
+  
+  redmine:
+    enabled: false
+  
+  mattermost:
+    enabled: false
+  
+  grafana:
+    enabled: false
+  
+  grader:
+    enabled: false
+  
+  benchmark:
+    enabled: false
+
+# === A2RCHI CORE CONFIGURATION ===
+a2rchi:
+  pipelines:
+    - QAPipeline
+  agent_description: "Indico events and slides knowledge base"
+  pipeline_map:
+    QAPipeline:
+      max_tokens: 10000
+      prompts:
+        required:
+          condense_prompt: prompts/condense/default.prompt
+          chat_prompt: prompts/chat/default.prompt
+      models:
+        required:
+          condense_model: OpenAIGPT35
+          chat_model: OpenAIGPT4
+  model_class_map:
+    OpenAIGPT4:
+      class: OpenAILLM
+      kwargs:
+        model_name: gpt-4o-mini
+        temperature: 1
+    OpenAIGPT35:
+      class: OpenAILLM
+      kwargs:
+        model_name: gpt-3.5-turbo
+        temperature: 1
+
+# === LOGGING ===
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  handlers:
+    - console
+    - file
+  file:
+    path: logs/indico-test.log
+    max_bytes: 10485760  # 10MB
+    backup_count: 5
+
+# === UTILITIES ===
+utils:
+  anonymizer:
+    enabled: false
+  
+  sso:
+    enabled: false
+

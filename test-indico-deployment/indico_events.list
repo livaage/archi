@@ -1,0 +1,19 @@
+# Indico Events to Scrape
+# Format: indico-<full-url>
+#
+# Find events at: https://indico.cern.ch/
+# Look for events with "Materials" (slides/PDFs attached)
+
+# FCC Week 2025 - Vienna (May 19-23, 2025)
+indico-https://indico.cern.ch/event/1408515/
+
+# Previous examples (commented out for now):
+# indico-https://indico.cern.ch/event/1443798/  # LLP Meeting
+# indico-https://indico.cern.ch/event/1202105/  # FCC Week 2023
+
+# Tips:
+# - Public events don't require authentication
+# - Protected events need SSO_USERNAME and SSO_PASSWORD in secrets.env
+# - Events without uploaded materials will show metadata only
+# - Slides are automatically converted to markdown (PDF, PPTX, PPT, ODP)
+

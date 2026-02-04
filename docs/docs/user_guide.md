@@ -176,6 +176,80 @@ Enable the git source during deployment with `--sources git`.
 
 ---
 
+### Indico Event Scraping
+
+A2RCHI can scrape scientific meetings, conferences, and workshops from CERN Indico (or other Indico instances), downloading and converting presentation materials to markdown for RAG ingestion.
+
+#### Features
+
+- Fetches event and contribution metadata via Indico REST API
+- Downloads slides (PDF, PPTX, PPT, ODP) and converts to markdown using [MarkItDown](https://github.com/microsoft/markitdown)
+- Supports authentication via CERN SSO for protected events
+- Stores only markdown (not original files) to minimize storage
+- Preserves hierarchical relationships (event → contribution → material)
+
+#### Configuration
+
+To enable Indico scraping in your configuration:
+
+```yaml
+data_manager:
+  sources:
+    indico:
+      enabled: true
+      base_url: https://indico.cern.ch
+      use_sso: true  # Use CERN SSO for authentication
+      sso_kwargs:
+        headless: true
+      slide_conversion:
+        enabled: true
+        formats:
+          - pdf
+          - pptx
+          - ppt
+          - odp
+        store_originals: false  # Only store markdown
+```
+
+#### URL Format
+
+In your input list files, prefix Indico URLs with `indico-`:
+
+```
+# Specific events
+indico-https://indico.cern.ch/event/123456/
+
+# Specific categories (scrapes all events in category)
+indico-https://indico.cern.ch/category/7389/
+```
+
+#### Secrets
+
+For protected events requiring CERN SSO authentication, provide credentials in your secrets file:
+
+```bash
+SSO_USERNAME=your-cern-username
+SSO_PASSWORD=your-cern-password
+```
+
+These are the same credentials used for SSO web scraping.
+
+#### Running
+
+Enable the Indico source during deployment with `--sources indico`.
+
+#### What Gets Stored
+
+For each event, A2RCHI creates markdown resources for:
+
+1. **Event metadata**: Title, description, dates, location
+2. **Contribution metadata**: Speaker, title, abstract, time
+3. **Materials**: Slides converted to markdown with metadata linking back to event/contribution
+
+All content is stored as markdown files with rich metadata for context-aware retrieval.
+
+---
+
 ### JIRA
 
 The JIRA integration allows A2RCHI to fetch issues and comments from specified JIRA projects and add them to the vector store, using the `JiraClient` class.

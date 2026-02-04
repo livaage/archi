@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterator, List
 
 from langchain_classic.chains.combine_documents.stuff import create_stuff_documents_chain
 from langchain_core.output_parsers import StrOutputParser
@@ -113,3 +113,11 @@ class QAPipeline(BasePipeline):
                 "question": inputs.get("question", ""),
             },
         )
+
+    def stream(self, **kwargs) -> Iterator[PipelineOutput]:
+        """Stream the pipeline output.
+        
+        This is a simple wrapper that yields the result of invoke() as a single chunk.
+        For true token-by-token streaming, the underlying LLM chains would need to support it.
+        """
+        yield self.invoke(**kwargs)

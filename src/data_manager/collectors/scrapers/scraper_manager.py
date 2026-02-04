@@ -15,6 +15,8 @@ logger = get_logger(__name__)
 if TYPE_CHECKING:
     from src.data_manager.collectors.scrapers.integrations.git_scraper import \
         GitScraper
+    from src.data_manager.collectors.scrapers.integrations.indico_scraper import \
+        IndicoScraper
 
 
 class ScraperManager:
@@ -28,6 +30,7 @@ class ScraperManager:
         selenium_config = links_config.get("selenium_scraper", {}) if isinstance(sources_config, dict) else {}
 
         git_config = sources_config.get("git", {}) if isinstance(sources_config, dict) else {}
+        indico_config = sources_config.get("indico", {}) if isinstance(sources_config, dict) else {}
         self.base_depth = links_config.get('base_source_depth', 5)
         logger.debug(f"Using base depth of {self.base_depth} for weblist URLs")
 
@@ -46,6 +49,8 @@ class ScraperManager:
         self.links_enabled = links_config.get("enabled", True)
         self.git_enabled = git_config.get("enabled", False) if isinstance(git_config, dict) else True
         self.git_config = git_config if isinstance(git_config, dict) else {}
+        self.indico_enabled = indico_config.get("enabled", False) if isinstance(indico_config, dict) else False
+        self.indico_config = indico_config if isinstance(indico_config, dict) else {}
         self.selenium_config = selenium_config or {}
         self.selenium_enabled = self.selenium_config.get("enabled", False)
         self.scrape_with_selenium = self.selenium_config.get("use_for_scraping", False)
@@ -62,16 +67,18 @@ class ScraperManager:
             enable_warnings=self.config.get("enable_warnings", True),
         )
         self._git_scraper: Optional["GitScraper"] = None
+        self._indico_scraper: Optional["IndicoScraper"] = None
           
     def collect_all_from_config(
         self, persistence: PersistenceService
     ) -> None:
         """Run the configured scrapers and persist their output."""
-        link_urls, git_urls, sso_urls = self._collect_urls_from_lists_by_type(self.input_lists)
+        link_urls, git_urls, sso_urls, indico_urls = self._collect_urls_from_lists_by_type(self.input_lists)
 
         self.collect_links(persistence, link_urls=link_urls)
         self.collect_sso(persistence, sso_urls=sso_urls)
         self.collect_git(persistence, git_urls=git_urls)
+        self.collect_indico(persistence, indico_urls=indico_urls)
 
         logger.info("Web scraping was completed successfully")
 
@@ -107,6 +114,22 @@ class ScraperManager:
             os.makedirs(git_dir, exist_ok=True)
         self._collect_git_resources(git_urls, persistence, git_dir)
 
+    def collect_indico(
+        self,
+        persistence: PersistenceService,
+        indico_urls: Optional[List[str]] = None,
+    ) -> None:
+        """Collect Indico events and materials."""
+        if not self.indico_enabled:
+            logger.info("Indico disabled, skipping Indico scraping")
+            return
+        if not indico_urls:
+            return
+        indico_dir = persistence.data_path / "indico"
+        if not os.path.exists(indico_dir):
+            os.makedirs(indico_dir, exist_ok=True)
+        self._collect_indico_resources(indico_urls, persistence, indico_dir)
+
     def collect_sso(
         self,
         persistence: PersistenceService,
@@ -136,6 +159,12 @@ class ScraperManager:
         metadata = persistence.catalog.get_metadata_by_filter("source_type", source_type="git", metadata_keys=["url"])
         catalog_urls = [m[1].get("url", "") for m in metadata]
         self.collect_git(persistence, git_urls=catalog_urls)
+
+    def schedule_collect_indico(self, persistence: PersistenceService, last_run: Optional[str] = None) -> None:
+        """Scheduled collection of Indico sources."""
+        metadata = persistence.catalog.get_metadata_by_filter("source_type", source_type="indico", metadata_keys=["url"])
+        catalog_urls = [m[1].get("url", "") for m in metadata]
+        self.collect_indico(persistence, indico_urls=catalog_urls)
 
     def schedule_collect_sso(self, persistence: PersistenceService, last_run: Optional[str] = None) -> None:
         metadata = persistence.catalog.get_metadata_by_filter("source_type", source_type="sso", metadata_keys=["url"])
@@ -220,11 +249,12 @@ class ScraperManager:
 
         return urls
 
-    def _collect_urls_from_lists_by_type(self, input_lists: List[str]) -> tuple[List[str], List[str], List[str]]:
+    def _collect_urls_from_lists_by_type(self, input_lists: List[str]) -> tuple[List[str], List[str], List[str], List[str]]:
         """All types of URLs are in the same input lists, separate them via prefixes"""
         link_urls: List[str] = []
         git_urls: List[str] = []
         sso_urls: List[str] = []
+        indico_urls: List[str] = []
         for raw_url in self._collect_urls_from_lists(input_lists):
             if raw_url.startswith("git-"):
                 git_urls.append(raw_url.split("git-", 1)[1])
@@ -232,8 +262,11 @@ class ScraperManager:
             if raw_url.startswith("sso-"):
                 sso_urls.append(raw_url.split("sso-", 1)[1])
                 continue
+            if raw_url.startswith("indico-"):
+                indico_urls.append(raw_url.split("indico-", 1)[1])
+                continue
             link_urls.append(raw_url)
-        return link_urls, git_urls, sso_urls
+        return link_urls, git_urls, sso_urls, indico_urls
     def _resolve_scraper(self):
         class_name = self.selenium_config.get("selenium_class")
         class_map = self.selenium_config.get("selenium_class_map", {})
@@ -311,3 +344,24 @@ class ScraperManager:
 
             self._git_scraper = GitScraper(manager=self, git_config=self.git_config)
         return self._git_scraper
+
+    def _collect_indico_resources(
+        self,
+        indico_urls: List[str],
+        persistence: PersistenceService,
+        indico_dir: Path,
+    ) -> List[ScrapedResource]:
+        """Collect Indico events and materials."""
+        indico_scraper = self._get_indico_scraper()
+        resources = indico_scraper.collect(indico_urls)
+        for resource in resources:
+            persistence.persist_resource(resource, indico_dir)
+        return resources
+
+    def _get_indico_scraper(self) -> "IndicoScraper":
+        if self._indico_scraper is None:
+            from src.data_manager.collectors.scrapers.integrations.indico_scraper import \
+                    IndicoScraper
+
+            self._indico_scraper = IndicoScraper(manager=self, indico_config=self.indico_config)
+        return self._indico_scraper

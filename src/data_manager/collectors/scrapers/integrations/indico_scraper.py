@@ -1,0 +1,699 @@
+"""Scraper integration for CERN Indico events and materials."""
+
+import re
+import time
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from urllib.parse import urlparse, urljoin
+
+import requests
+
+from src.data_manager.collectors.scrapers.scraped_resource import ScrapedResource
+from src.data_manager.collectors.utils.slide_converter import SlideConverter
+from src.utils.config_loader import load_global_config
+from src.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+if TYPE_CHECKING:
+    from src.data_manager.collectors.scrapers.scraper_manager import ScraperManager
+
+
+class IndicoScraper:
+    """Scraper integration for CERN Indico events and materials.
+    
+    Uses Indico REST API to fetch event metadata and CERNSSOScraper
+    for authentication. Downloads attachments and converts slides to
+    markdown using MarkItDown (no original file storage).
+    """
+
+    def __init__(self, manager: "ScraperManager", indico_config: Optional[Dict[str, Any]] = None) -> None:
+        """Initialize the Indico scraper.
+        
+        Args:
+            manager: Parent ScraperManager instance
+            indico_config: Configuration dictionary for Indico scraping
+        """
+        self.manager = manager
+        self.config = indico_config or {}
+
+        global_config = load_global_config()
+        self.data_path = global_config["DATA_PATH"]
+
+        # Configuration
+        self.base_url = self.config.get("base_url", "https://indico.cern.ch")
+        self.use_sso = self.config.get("use_sso", True)
+        
+        # Slide conversion config
+        slide_config = self.config.get("slide_conversion", {})
+        self.conversion_enabled = slide_config.get("enabled", True)
+        self.supported_formats = set(slide_config.get("formats", ["pdf", "pptx", "ppt", "odp"]))
+        
+        # Initialize slide converter
+        llm_client = slide_config.get("llm_client")
+        llm_model = slide_config.get("llm_model")
+        self.slide_converter = SlideConverter(llm_client=llm_client, llm_model=llm_model)
+
+        # SSO scraper for authentication
+        self.sso_scraper = None
+        if self.use_sso:
+            try:
+                from src.data_manager.collectors.scrapers.integrations.sso_scraper import CERNSSOScraper
+                sso_kwargs = self.config.get("sso_kwargs", {"headless": True})
+                self.sso_scraper = CERNSSOScraper(**sso_kwargs)
+                logger.info("Initialized CERNSSOScraper for Indico authentication")
+            except Exception as e:
+                logger.warning(f"Failed to initialize SSO scraper: {e}")
+                self.sso_scraper = None
+
+    def collect(self, event_urls: List[str]) -> List[ScrapedResource]:
+        """Collect events, contributions, and materials from Indico URLs.
+        
+        Args:
+            event_urls: List of Indico event or category URLs
+            
+        Returns:
+            List of ScrapedResource objects with converted markdown content
+        """
+        if not event_urls:
+            return []
+
+        resources: List[ScrapedResource] = []
+        
+        try:
+            # Set up authenticated session if SSO is enabled
+            session = self._setup_authenticated_session(event_urls[0])
+            
+            for url in event_urls:
+                try:
+                    if "/event/" in url:
+                        event_id = self._extract_event_id(url)
+                        if event_id:
+                            resources.extend(self._collect_event(event_id, session))
+                    elif "/category/" in url:
+                        category_id = self._extract_category_id(url)
+                        if category_id:
+                            resources.extend(self._collect_category(category_id, session))
+                    else:
+                        logger.warning(f"Unrecognized Indico URL format: {url}")
+                except Exception as e:
+                    logger.error(f"Error collecting from {url}: {e}")
+                    
+        finally:
+            # Clean up SSO scraper
+            if self.sso_scraper:
+                self.sso_scraper.close()
+
+        logger.info(f"Indico scraping completed. Collected {len(resources)} resources.")
+        return resources
+
+    def _setup_authenticated_session(self, initial_url: str) -> requests.Session:
+        """Set up an authenticated session using CERNSSOScraper.
+        
+        Args:
+            initial_url: URL to trigger authentication
+            
+        Returns:
+            Authenticated requests.Session
+        """
+        session = requests.Session()
+        
+        if self.sso_scraper:
+            try:
+                logger.info("Setting up authenticated session with CERN SSO")
+                self.sso_scraper.setup_driver()
+                
+                # Authenticate and get cookies
+                cookies = self.sso_scraper.authenticate(initial_url)
+                
+                if cookies:
+                    for cookie in cookies:
+                        session.cookies.set(cookie['name'], cookie['value'])
+                    logger.info("Successfully authenticated with CERN SSO")
+                else:
+                    logger.warning("Authentication did not return cookies")
+                    
+            except Exception as e:
+                logger.error(f"Error during SSO authentication: {e}")
+        
+        return session
+
+    def _collect_event(self, event_id: str, session: requests.Session) -> List[ScrapedResource]:
+        """Collect a single event with its contributions and materials.
+        
+        Args:
+            event_id: Indico event ID
+            session: Authenticated session
+            
+        Returns:
+            List of ScrapedResource objects
+        """
+        resources: List[ScrapedResource] = []
+        
+        try:
+            # Fetch event metadata
+            event_data = self._fetch_event_metadata(event_id, session)
+            if not event_data:
+                return resources
+            
+            # Create resource for event metadata
+            event_resource = self._create_event_resource(event_id, event_data)
+            if event_resource:
+                resources.append(event_resource)
+            
+            # Fetch contributions (talks)
+            contributions = self._fetch_contributions(event_id, session)
+            
+            for contribution in contributions:
+                # Create resource for contribution metadata
+                contrib_resource = self._create_contribution_resource(event_id, contribution)
+                if contrib_resource:
+                    resources.append(contrib_resource)
+                
+                # Download and convert materials
+                material_resources = self._collect_materials(
+                    event_id,
+                    contribution,
+                    session
+                )
+                resources.extend(material_resources)
+                
+        except Exception as e:
+            logger.error(f"Error collecting event {event_id}: {e}")
+        
+        return resources
+
+    def _collect_category(self, category_id: str, session: requests.Session) -> List[ScrapedResource]:
+        """Collect events from a category.
+        
+        For now, only collects events directly in the category (no recursion).
+        
+        Args:
+            category_id: Indico category ID
+            session: Authenticated session
+            
+        Returns:
+            List of ScrapedResource objects
+        """
+        resources: List[ScrapedResource] = []
+        
+        try:
+            # Fetch category metadata to get list of events
+            category_url = f"{self.base_url}/export/category/{category_id}.json"
+            response = session.get(category_url, timeout=30)
+            response.raise_for_status()
+            category_data = response.json()
+            
+            events = category_data.get("results", [])
+            logger.info(f"Found {len(events)} events in category {category_id}")
+            
+            for event in events:
+                event_id = str(event.get("id", ""))
+                if event_id:
+                    resources.extend(self._collect_event(event_id, session))
+                    
+        except Exception as e:
+            logger.error(f"Error collecting category {category_id}: {e}")
+        
+        return resources
+
+    def _fetch_event_metadata(self, event_id: str, session: requests.Session) -> Optional[Dict]:
+        """Fetch event metadata from Indico API.
+        
+        Args:
+            event_id: Event ID
+            session: Authenticated session
+            
+        Returns:
+            Event data dictionary or None
+        """
+        try:
+            url = f"{self.base_url}/export/event/{event_id}.json"
+            logger.info(f"Fetching event metadata: {url}")
+            
+            response = session.get(url, timeout=30)
+            response.raise_for_status()
+            
+            data = response.json()
+            # Indico wraps the event in a 'results' list
+            if isinstance(data, dict) and "results" in data:
+                results = data["results"]
+                if results and len(results) > 0:
+                    return results[0]
+            
+            return data
+            
+        except Exception as e:
+            logger.error(f"Error fetching event {event_id}: {e}")
+            return None
+
+    def _fetch_contributions(self, event_id: str, session: requests.Session) -> List[Dict]:
+        """Fetch all contributions (talks) for an event.
+        
+        Args:
+            event_id: Event ID
+            session: Authenticated session
+            
+        Returns:
+            List of contribution dictionaries
+        """
+        try:
+            url = f"{self.base_url}/export/event/{event_id}.json?detail=contributions"
+            logger.info(f"Fetching contributions: {url}")
+            
+            response = session.get(url, timeout=30)
+            response.raise_for_status()
+            
+            data = response.json()
+            results = data.get("results", [])
+            if results and isinstance(results, list) and len(results) > 0:
+                contributions = results[0].get("contributions", [])
+            else:
+                contributions = []
+            logger.info(f"Found {len(contributions)} contributions for event {event_id}")
+            
+            return contributions
+            
+        except Exception as e:
+            logger.error(f"Error fetching contributions for event {event_id}: {e}")
+            return []
+
+    def _collect_materials(
+        self,
+        event_id: str,
+        contribution: Dict,
+        session: requests.Session
+    ) -> List[ScrapedResource]:
+        """Download and convert materials for a contribution.
+        
+        Args:
+            event_id: Event ID
+            contribution: Contribution data dictionary
+            session: Authenticated session
+            
+        Returns:
+            List of ScrapedResource objects with markdown content
+        """
+        resources: List[ScrapedResource] = []
+        
+        contribution_id = str(contribution.get("id", ""))
+        folders = contribution.get("folders", [])
+        
+        for folder in folders:
+            attachments = folder.get("attachments", [])
+            
+            for attachment in attachments:
+                try:
+                    resource = self._download_and_convert_material(
+                        event_id,
+                        contribution_id,
+                        contribution,
+                        attachment,
+                        session
+                    )
+                    if resource:
+                        resources.append(resource)
+                except Exception as e:
+                    logger.error(f"Error processing attachment: {e}")
+        
+        return resources
+
+    def _download_and_convert_material(
+        self,
+        event_id: str,
+        contribution_id: str,
+        contribution: Dict,
+        attachment: Dict,
+        session: requests.Session
+    ) -> Optional[ScrapedResource]:
+        """Download an attachment and convert to markdown.
+        
+        Only stores the markdown conversion, not the original file.
+        
+        Args:
+            event_id: Event ID
+            contribution_id: Contribution ID
+            contribution: Full contribution data
+            attachment: Attachment data dictionary
+            session: Authenticated session
+            
+        Returns:
+            ScrapedResource with markdown content, or None if conversion fails
+        """
+        if not self.conversion_enabled:
+            logger.debug("Slide conversion disabled, skipping")
+            return None
+        
+        filename = attachment.get("filename", "")
+        download_url = attachment.get("download_url", "")
+        content_type = attachment.get("content_type", "")
+        
+        # Check if format is supported
+        file_ext = Path(filename).suffix.lstrip(".").lower()
+        if file_ext not in self.supported_formats:
+            logger.debug(f"Skipping unsupported format: {file_ext}")
+            return None
+        
+        try:
+            # Download file
+            logger.info(f"Downloading material: {filename}")
+            
+            # Handle relative URLs
+            if not download_url.startswith("http"):
+                download_url = urljoin(self.base_url, download_url)
+            
+            response = session.get(download_url, timeout=60)
+            response.raise_for_status()
+            
+            file_bytes = response.content
+            logger.info(f"Downloaded {len(file_bytes)} bytes")
+            
+            # Convert to markdown
+            conversion_result = self.slide_converter.convert_bytes(
+                file_bytes,
+                content_type,
+                filename
+            )
+            
+            if conversion_result.error:
+                logger.error(f"Conversion failed: {conversion_result.error}")
+                return None
+            
+            if not conversion_result.markdown:
+                logger.warning(f"Conversion produced empty markdown for {filename}")
+                return None
+            
+            # Extract contribution metadata for richer context
+            contrib_code = contribution.get("code", "")
+            contrib_type = contribution.get("contribution_type", contribution.get("type", ""))
+            keywords = contribution.get("keywords", [])
+            
+            # Create resource with markdown content
+            resource = ScrapedResource(
+                url=download_url,
+                content=conversion_result.markdown,
+                suffix="md",
+                source_type="indico",
+                metadata={
+                    "event_id": event_id,
+                    "contribution_id": contribution_id,
+                    "contribution_code": contrib_code,
+                    "contribution_title": contribution.get("title", ""),
+                    "contribution_type": contrib_type if contrib_type else "",
+                    "speaker": self._extract_speaker_name(contribution),
+                    "keywords": ", ".join(keywords) if keywords else "",
+                    "resource_type": "material",
+                    "original_filename": filename,
+                    "original_format": file_ext,
+                    "original_size_bytes": str(len(file_bytes)),
+                    "content_type": content_type,
+                    "converted_to_markdown": "true",
+                    "material_title": attachment.get("title", ""),
+                },
+                file_name=f"{Path(filename).stem}.md",
+            )
+            
+            logger.info(f"Successfully converted {filename} to markdown")
+            return resource
+            
+        except Exception as e:
+            logger.error(f"Error downloading/converting {filename}: {e}")
+            return None
+
+    def _create_event_resource(self, event_id: str, event_data: Dict) -> Optional[ScrapedResource]:
+        """Create a resource representing event metadata.
+        
+        Args:
+            event_id: Event ID
+            event_data: Event data dictionary
+            
+        Returns:
+            ScrapedResource with event metadata as markdown
+        """
+        try:
+            title = event_data.get("title", "Unknown Event")
+            description = event_data.get("description", "")
+            location = event_data.get("location", "")
+            room = event_data.get("room", "")
+            roomFullname = event_data.get("roomFullname", "")
+            start_date = event_data.get("startDate", {})
+            end_date = event_data.get("endDate", {})
+            url = event_data.get("url", f"{self.base_url}/event/{event_id}/")
+            event_type = event_data.get("type", "")
+            category = event_data.get("category", "")
+            category_id = event_data.get("categoryId", "")
+            keywords = event_data.get("keywords", [])
+            organizer = event_data.get("organizer", "")
+            timezone = event_data.get("timezone", "")
+            chairs = event_data.get("chairs", [])
+            
+            # Format metadata as markdown
+            markdown_content = f"# {title}\n\n"
+            
+            if description:
+                markdown_content += f"{description}\n\n"
+            
+            markdown_content += "## Event Details\n\n"
+            
+            if event_type:
+                markdown_content += f"- **Type**: {event_type}\n"
+            if category:
+                markdown_content += f"- **Category**: {category}\n"
+            if start_date:
+                markdown_content += f"- **Start**: {start_date.get('date', '')} {start_date.get('time', '')}"
+                if timezone:
+                    markdown_content += f" ({timezone})"
+                markdown_content += "\n"
+            if end_date:
+                markdown_content += f"- **End**: {end_date.get('date', '')} {end_date.get('time', '')}"
+                if timezone:
+                    markdown_content += f" ({timezone})"
+                markdown_content += "\n"
+            if location:
+                markdown_content += f"- **Location**: {location}"
+                if room:
+                    markdown_content += f", {room}"
+                elif roomFullname:
+                    markdown_content += f", {roomFullname}"
+                markdown_content += "\n"
+            if organizer:
+                markdown_content += f"- **Organizer**: {organizer}\n"
+            
+            # Add chairs/organizers
+            if chairs:
+                chair_names = []
+                for chair in chairs:
+                    if isinstance(chair, dict):
+                        name = chair.get("fullName", chair.get("name", ""))
+                        if name:
+                            chair_names.append(name)
+                if chair_names:
+                    markdown_content += f"- **Chairs**: {', '.join(chair_names)}\n"
+            
+            # Add keywords
+            if keywords:
+                markdown_content += f"- **Keywords**: {', '.join(keywords)}\n"
+            
+            markdown_content += f"- **URL**: {url}\n"
+            
+            resource = ScrapedResource(
+                url=url,
+                content=markdown_content,
+                suffix="md",
+                source_type="indico",
+                metadata={
+                    "event_id": event_id,
+                    "resource_type": "event",
+                    "title": title,
+                    "event_type": event_type,
+                    "category": category,
+                    "category_id": str(category_id) if category_id else "",
+                    "location": location,
+                    "room": roomFullname or room,
+                    "start_date": start_date.get("date", ""),
+                    "end_date": end_date.get("date", ""),
+                    "timezone": timezone,
+                    "organizer": organizer,
+                    "keywords": ", ".join(keywords) if keywords else "",
+                    "chairs": ", ".join([c.get("fullName", "") for c in chairs if isinstance(c, dict)]),
+                },
+                file_name=f"event_{event_id}.md",
+            )
+            
+            return resource
+            
+        except Exception as e:
+            logger.error(f"Error creating event resource: {e}")
+            return None
+
+    def _create_contribution_resource(self, event_id: str, contribution: Dict) -> Optional[ScrapedResource]:
+        """Create a resource representing contribution metadata.
+        
+        Args:
+            event_id: Event ID
+            contribution: Contribution data dictionary
+            
+        Returns:
+            ScrapedResource with contribution metadata as markdown
+        """
+        try:
+            contrib_id = str(contribution.get("id", ""))
+            title = contribution.get("title", "Unknown Contribution")
+            description = contribution.get("description", "")
+            duration = contribution.get("duration", "")
+            start_date = contribution.get("startDate", {})
+            speaker = self._extract_speaker_name(contribution)
+            url = f"{self.base_url}/event/{event_id}/contributions/{contrib_id}/"
+            
+            # Extract additional metadata
+            code = contribution.get("code", "")
+            contrib_type = contribution.get("type", "")
+            location = contribution.get("location", "")
+            room = contribution.get("room", "")
+            roomFullname = contribution.get("roomFullname", "")
+            session = contribution.get("session", "")
+            track = contribution.get("track", "")
+            keywords = contribution.get("keywords", [])
+            
+            # Extract authors
+            primary_authors = contribution.get("primaryauthors", [])
+            coauthors = contribution.get("coauthors", [])
+            
+            def extract_author_names(author_list):
+                names = []
+                for author in author_list:
+                    if isinstance(author, dict):
+                        name = author.get("fullName", author.get("name", ""))
+                        if name:
+                            names.append(name)
+                return names
+            
+            primary_author_names = extract_author_names(primary_authors)
+            coauthor_names = extract_author_names(coauthors)
+            
+            # Format as markdown
+            markdown_content = f"# {title}\n\n"
+            
+            if code:
+                markdown_content += f"**Contribution Code**: {code}\n\n"
+            
+            if speaker:
+                markdown_content += f"**Speaker**: {speaker}\n\n"
+            
+            # Add authors
+            if primary_author_names:
+                markdown_content += f"**Primary Authors**: {', '.join(primary_author_names)}\n\n"
+            if coauthor_names:
+                markdown_content += f"**Co-authors**: {', '.join(coauthor_names)}\n\n"
+            
+            if description:
+                markdown_content += f"{description}\n\n"
+            
+            markdown_content += "## Details\n\n"
+            
+            if contrib_type:
+                markdown_content += f"- **Type**: {contrib_type}\n"
+            if start_date:
+                markdown_content += f"- **Time**: {start_date.get('date', '')} {start_date.get('time', '')}\n"
+            if duration:
+                markdown_content += f"- **Duration**: {duration} minutes\n"
+            if location:
+                markdown_content += f"- **Location**: {location}"
+                if room:
+                    markdown_content += f", {room}"
+                elif roomFullname:
+                    markdown_content += f", {roomFullname}"
+                markdown_content += "\n"
+            if session:
+                markdown_content += f"- **Session**: {session}\n"
+            if track:
+                markdown_content += f"- **Track**: {track}\n"
+            if keywords:
+                markdown_content += f"- **Keywords**: {', '.join(keywords)}\n"
+            
+            markdown_content += f"- **URL**: {url}\n"
+            
+            resource = ScrapedResource(
+                url=url,
+                content=markdown_content,
+                suffix="md",
+                source_type="indico",
+                metadata={
+                    "event_id": event_id,
+                    "contribution_id": contrib_id,
+                    "resource_type": "contribution",
+                    "title": title,
+                    "code": code,
+                    "contribution_type": contrib_type if contrib_type else "",
+                    "speaker": speaker,
+                    "primary_authors": ", ".join(primary_author_names),
+                    "coauthors": ", ".join(coauthor_names),
+                    "start_date": start_date.get("date", ""),
+                    "duration": str(duration) if duration else "",
+                    "location": location,
+                    "room": roomFullname or room,
+                    "session": session if session else "",
+                    "track": track if track else "",
+                    "keywords": ", ".join(keywords) if keywords else "",
+                },
+                file_name=f"contribution_{contrib_id}.md",
+            )
+            
+            return resource
+            
+        except Exception as e:
+            logger.error(f"Error creating contribution resource: {e}")
+            return None
+
+    def _extract_speaker_name(self, contribution: Dict) -> str:
+        """Extract speaker name from contribution data.
+        
+        Args:
+            contribution: Contribution data dictionary
+            
+        Returns:
+            Speaker name or empty string
+        """
+        speakers = contribution.get("speakers", [])
+        if speakers and len(speakers) > 0:
+            first_speaker = speakers[0]
+            full_name = first_speaker.get("fullName", "")
+            if full_name:
+                return full_name
+            # Fallback to first + last name
+            first = first_speaker.get("first_name", "")
+            last = first_speaker.get("last_name", "")
+            return f"{first} {last}".strip()
+        return ""
+
+    def _extract_event_id(self, url: str) -> Optional[str]:
+        """Extract event ID from Indico URL.
+        
+        Args:
+            url: Indico event URL
+            
+        Returns:
+            Event ID or None
+        """
+        # Match /event/123456/ or /event/123456
+        match = re.search(r'/event/(\d+)', url)
+        if match:
+            return match.group(1)
+        return None
+
+    def _extract_category_id(self, url: str) -> Optional[str]:
+        """Extract category ID from Indico URL.
+        
+        Args:
+            url: Indico category URL
+            
+        Returns:
+            Category ID or None
+        """
+        # Match /category/123/ or /category/123
+        match = re.search(r'/category/(\d+)', url)
+        if match:
+            return match.group(1)
+        return None
+
+
