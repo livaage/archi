@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Preflight checks for Postgres, ChromaDB, data-manager, and Ollama."""
+"""Preflight checks for Postgres, data-manager, and Ollama."""
 import os
 import sys
 import time
@@ -76,7 +76,7 @@ def _wait_for_ingestion() -> None:
     deadline = time.time() + timeout
     while True:
         try:
-            resp = requests.get(status_url, headers=_build_dm_headers(), timeout=10)
+            resp = requests.get(status_url, timeout=10)
             if resp.status_code != 200:
                 _fail(f"Ingestion status check failed: HTTP {resp.status_code}")
             payload = resp.json()
@@ -94,44 +94,6 @@ def _wait_for_ingestion() -> None:
         time.sleep(interval)
 
 
-def _check_chromadb() -> None:
-    chroma_url = os.getenv("CHROMA_URL", "http://localhost:8000").rstrip("/")
-    endpoints = [
-        f"{chroma_url}/api/v2/heartbeat",
-        f"{chroma_url}/api/v1/heartbeat",
-        f"{chroma_url}/api/v2/collections",
-        f"{chroma_url}/api/v1/collections",
-    ]
-    _info(f"Checking ChromaDB endpoints at {chroma_url} ...")
-    try:
-        for endpoint in endpoints:
-            resp = requests.get(endpoint, timeout=5)
-            if resp.status_code == 200:
-                _info(f"ChromaDB OK ({endpoint})")
-                return
-            if resp.status_code == 410:
-                continue
-        import socket
-
-        parsed = chroma_url.replace("http://", "").replace("https://", "")
-        host, _, port_str = parsed.partition(":")
-        port = int(port_str) if port_str else 8000
-        with socket.create_connection((host, port), timeout=5):
-            pass
-        _info("ChromaDB reachable (TCP check only)")
-        return
-    except Exception as exc:
-        _fail(f"ChromaDB check failed: {exc}")
-    _info("ChromaDB OK")
-
-
-def _build_dm_headers() -> Dict[str, str]:
-    token = os.getenv("DM_API_TOKEN", "").strip()
-    if not token:
-        return {}
-    return {"Authorization": f"Bearer {token}"}
-
-
 def _check_data_manager_catalog() -> None:
     dm_base_url = os.getenv("DM_BASE_URL", "http://localhost:7871").rstrip("/")
     query = os.getenv("DM_CATALOG_QUERY", "file_name:seed.txt")
@@ -147,7 +109,6 @@ def _check_data_manager_catalog() -> None:
             resp = requests.get(
                 search_url,
                 params={"q": query, "limit": 1, "search_content": "false"},
-                headers=_build_dm_headers(),
                 timeout=10,
             )
             if resp.status_code != 200:
@@ -162,7 +123,6 @@ def _check_data_manager_catalog() -> None:
                 resp = requests.get(
                     search_url,
                     params={"q": filename_query, "limit": 1, "search_content": "false"},
-                    headers=_build_dm_headers(),
                     timeout=10,
                 )
                 if resp.status_code == 200 and (resp.json().get("hits") or []):
@@ -179,7 +139,6 @@ def _check_data_manager_catalog() -> None:
                     resp = requests.post(
                         f"{dm_base_url}/document_index/upload",
                         files=files,
-                        headers=_build_dm_headers(),
                         timeout=30,
                     )
                 if resp.status_code != 200:
@@ -222,13 +181,13 @@ def _check_config_ollama(config_path: str, pipeline_name: str, ollama_model: str
     except Exception as exc:
         _fail(f"Failed to read config at {config_path}: {exc}")
 
-    pipeline_cfg = ((config.get("a2rchi") or {}).get("pipeline_map") or {}).get(pipeline_name) or {}
+    pipeline_cfg = ((config.get("archi") or {}).get("pipeline_map") or {}).get(pipeline_name) or {}
     required_models = (pipeline_cfg.get("models") or {}).get("required") or {}
     agent_model = required_models.get("agent_model")
     if agent_model != "OllamaInterface":
         _fail(f"Pipeline {pipeline_name} agent_model is '{agent_model}', expected 'OllamaInterface'")
 
-    model_map = (config.get("a2rchi") or {}).get("model_class_map") or {}
+    model_map = (config.get("archi") or {}).get("model_class_map") or {}
     ollama_cfg = (model_map.get("OllamaInterface") or {}).get("kwargs") or {}
     base_model = ollama_cfg.get("base_model")
     if base_model and base_model != ollama_model:
@@ -241,17 +200,17 @@ def _check_config_ollama(config_path: str, pipeline_name: str, ollama_model: str
 def main() -> None:
     _wait_for_ingestion()
     _check_postgres()
-    _check_chromadb()
+    # ChromaDB removed - PostgreSQL with pgvector is the only supported backend
     _check_data_manager_catalog()
     _check_ollama_model()
 
-    config_path = os.getenv("A2RCHI_CONFIG_PATH")
-    pipeline_name = os.getenv("A2RCHI_PIPELINE_NAME", "CMSCompOpsAgent")
+    config_path = os.getenv("ARCHI_CONFIG_PATH")
+    pipeline_name = os.getenv("ARCHI_PIPELINE_NAME", "CMSCompOpsAgent")
     ollama_model = os.getenv("OLLAMA_MODEL", "")
     if config_path:
         _check_config_ollama(config_path, pipeline_name, ollama_model)
     else:
-        _info("A2RCHI_CONFIG_PATH not set; skipping config Ollama validation")
+        _info("ARCHI_CONFIG_PATH not set; skipping config Ollama validation")
 
     _info("Preflight checks passed")
 

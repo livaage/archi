@@ -15,13 +15,14 @@ from flask_cors import CORS
 from src.data_manager.collectors.persistence import PersistenceService
 from src.data_manager.collectors.localfile_manager import LocalFileManager
 from src.data_manager.collectors.scrapers.scraper_manager import ScraperManager
-from src.data_manager.collectors.utils.index_utils import CatalogService
+from src.data_manager.collectors.utils.catalog_postgres import PostgresCatalogService
 from src.data_manager.collectors.tickets.ticket_manager import TicketManager
 from src.data_manager.vectorstore.loader_utils import load_text_from_path
 from src.interfaces.chat_app.document_utils import check_credentials
-from src.utils.config_loader import load_config
 from src.utils.env import read_secret
 from src.utils.logging import get_logger
+from src.data_manager.collectors.utils.catalog_postgres import _METADATA_COLUMN_MAP
+from src.utils.config_access import get_full_config
 
 logger = get_logger(__name__)
 
@@ -37,7 +38,7 @@ class FlaskAppWrapper:
         status_file: Optional[Path] = None,
     ) -> None:
         self.app = app
-        self.config = load_config()
+        self.config = get_full_config()
         self.global_config = self.config["global"]
         self.services_config = self.config["services"]
 
@@ -47,7 +48,7 @@ class FlaskAppWrapper:
             **self.services_config["postgres"],
         }
         self.persistence = PersistenceService(self.data_path, pg_config=self.pg_config)
-        self.catalog = CatalogService(self.data_path, pg_config=self.pg_config)
+        self.catalog = PostgresCatalogService(self.data_path, pg_config=self.pg_config)
         self.status_file = status_file or (Path(self.data_path) / "ingestion_status.json")
 
         secret_key = read_secret("FLASK_UPLOADER_APP_SECRET_KEY") or secrets.token_hex(32)
@@ -56,7 +57,6 @@ class FlaskAppWrapper:
 
         self.auth_config = (self.services_config or {}).get("data_manager", {}).get("auth", {}) or {}
         self.auth_enabled = bool(self.auth_config.get("enabled", True))
-        self.api_token = (read_secret("DM_API_TOKEN") or "").strip() or None
         self.admin_users = {
             user.strip().lower()
             for user in (self.auth_config.get("admins") or [])
@@ -103,6 +103,7 @@ class FlaskAppWrapper:
         # API endpoints for remote catalog access
         self.add_endpoint("/api/catalog/search", "api_catalog_search", protected(self.api_catalog_search), methods=["GET"])
         self.add_endpoint("/api/catalog/document/<path:resource_hash>", "api_catalog_document", protected(self.api_catalog_document), methods=["GET"])
+        self.add_endpoint("/api/catalog/schema", "api_catalog_schema", protected(self.api_catalog_schema), methods=["GET"])
         if self.auth_enabled:
             self.add_endpoint("/login", "login", self.login, methods=["GET", "POST"])
             self.add_endpoint("/logout", "logout", self.logout)
@@ -121,9 +122,7 @@ class FlaskAppWrapper:
             if session.get("admin_logged_in"):
                 return handler(*args, **kwargs)
             if request.path.startswith("/api/"):
-                if self._api_token_valid():
-                    return handler(*args, **kwargs)
-                return jsonify({"error": "unauthorized", "message": "Authentication required"}), 401
+                return handler(*args, **kwargs)
             return redirect(url_for("login"))
 
         return wrapped
@@ -137,27 +136,6 @@ class FlaskAppWrapper:
         if not self.admin_users:
             return True
         return normalized in self.admin_users
-
-    def _api_token_valid(self) -> bool:
-        if not self.api_token:
-            return False
-        token = self._extract_api_token()
-        if not token:
-            return False
-        return secrets.compare_digest(token, self.api_token)
-
-    @staticmethod
-    def _extract_api_token() -> Optional[str]:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.lower().startswith("bearer "):
-            token = auth_header.split(" ", 1)[1].strip()
-            return token or None
-        token = (
-            request.headers.get("X-A2RCHI-API-TOKEN")
-            or request.headers.get("X-API-Token")
-            or request.headers.get("X-API-Key")
-        )
-        return token.strip() if token else None
 
     def login(self):
         if not self.auth_enabled:
@@ -687,6 +665,18 @@ class FlaskAppWrapper:
             text = text[:max_chars]
         return jsonify({"hash": resource_hash, "path": str(path), "metadata": metadata, "text": text})
 
+    def api_catalog_schema(self):
+        """
+        Return metadata schema hints for agents: supported keys and distinct values for source_type/suffix.
+        """
+        keys = sorted(_METADATA_COLUMN_MAP.keys())
+        distinct = self.catalog.get_distinct_metadata(["source_type", "suffix"])
+        return jsonify({
+            "keys": keys,
+            "source_types": distinct.get("source_type", []),
+            "suffixes": distinct.get("suffix", []),
+        })
+
 
 def _flatten_metadata(data: Dict[str, object], prefix: str = "") -> Dict[str, str]:
     flattened: Dict[str, str] = {}
@@ -697,6 +687,12 @@ def _flatten_metadata(data: Dict[str, object], prefix: str = "") -> Dict[str, st
         else:
             flattened[full_key] = "" if value is None else str(value)
     return flattened
+
+
+_METADATA_ALIAS_MAP = {
+    "resource_type": "source_type",
+    "resource_id": "ticket_id",
+}
 
 
 def _parse_metadata_query(query: str) -> Tuple[Dict[str, str] | List[Dict[str, str]], str]:
@@ -714,6 +710,8 @@ def _parse_metadata_query(query: str) -> Tuple[Dict[str, str] | List[Dict[str, s
             key = key.strip()
             value = value.strip()
             if key and value:
+                # Normalize legacy keys to canonical column names
+                key = _METADATA_ALIAS_MAP.get(key, key)
                 current_group[key] = value
                 continue
         free_tokens.append(token)
