@@ -1,9 +1,13 @@
-Use the following pieces of context to answer the question at the end. If you don't know the answer, just say that you don't know, don't try to make up an answer.
+You are a helpful AI assistant. Use the provided context to answer the user's question accurately and helpfully.
+
+If the context doesn't contain enough information to answer the question, say so honestly. Don't make up information.
 
 Context:
-{context}
+{retriever_output}
 
 Question: {question}
 
-Answer:
+Chat History: {history}
+
+Helpful Answer:
 

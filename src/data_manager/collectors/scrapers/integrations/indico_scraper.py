@@ -2,6 +2,8 @@
 
 import re
 import time
+from datetime import date as date_cls
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from urllib.parse import urlparse, urljoin
@@ -10,7 +12,7 @@ import requests
 
 from src.data_manager.collectors.scrapers.scraped_resource import ScrapedResource
 from src.data_manager.collectors.utils.slide_converter import SlideConverter
-from src.utils.config_loader import load_global_config
+from src.utils.yaml_config import load_global_config
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -107,6 +109,58 @@ class IndicoScraper:
         logger.info(f"Indico scraping completed. Collected {len(resources)} resources.")
         return resources
 
+    def _compute_allowed_contribution_dates(self, event_data: Dict[str, Any]) -> Optional[set[str]]:
+        """
+        Compute allowed contribution dates (YYYY-MM-DD) based on configuration.
+
+        Supported config keys under `data_manager.sources.indico`:
+          - days: [YYYY-MM-DD, ...] (explicit allow-list)
+          - date_range: {from: YYYY-MM-DD, to: YYYY-MM-DD} (inclusive)
+          - only_first_day: true (alias: first_day_only)
+          - day_limit: N (alias: max_days) -> allow first N days starting at event startDate
+        """
+        # Highest precedence: explicit allow-list
+        days = self.config.get("days")
+        if isinstance(days, list) and days:
+            return {str(d).strip() for d in days if str(d).strip()}
+
+        # Next: inclusive date range
+        date_range = self.config.get("date_range")
+        if isinstance(date_range, dict):
+            start_s = str(date_range.get("from", "")).strip()
+            end_s = str(date_range.get("to", "")).strip()
+            if start_s and end_s:
+                try:
+                    start_d = date_cls.fromisoformat(start_s)
+                    end_d = date_cls.fromisoformat(end_s)
+                    if end_d < start_d:
+                        start_d, end_d = end_d, start_d
+                    out: set[str] = set()
+                    cur = start_d
+                    while cur <= end_d:
+                        out.add(cur.isoformat())
+                        cur += timedelta(days=1)
+                    return out
+                except Exception as e:
+                    logger.warning(f"Invalid indico.date_range; expected YYYY-MM-DD: {e}")
+
+        # Next: first day only
+        only_first_day = bool(self.config.get("only_first_day") or self.config.get("first_day_only"))
+        start_date_s = str((event_data.get("startDate") or {}).get("date", "")).strip()
+        if only_first_day and start_date_s:
+            return {start_date_s}
+
+        # Next: first N days
+        day_limit = self.config.get("day_limit", self.config.get("max_days"))
+        if isinstance(day_limit, int) and day_limit > 0 and start_date_s:
+            try:
+                start_d = date_cls.fromisoformat(start_date_s)
+                return {(start_d + timedelta(days=i)).isoformat() for i in range(day_limit)}
+            except Exception as e:
+                logger.warning(f"Invalid indico day_limit/max_days start date '{start_date_s}': {e}")
+
+        return None
+
     def _setup_authenticated_session(self, initial_url: str) -> requests.Session:
         """Set up an authenticated session using CERNSSOScraper.
         
@@ -163,6 +217,21 @@ class IndicoScraper:
             
             # Fetch contributions (talks)
             contributions = self._fetch_contributions(event_id, session)
+
+            allowed_dates = self._compute_allowed_contribution_dates(event_data)
+            if allowed_dates:
+                before = len(contributions)
+                contributions = [
+                    c for c in contributions
+                    if str((c.get("startDate") or {}).get("date", "")).strip() in allowed_dates
+                ]
+                logger.info(
+                    "Filtering contributions by date for event %s: %s (kept %s/%s)",
+                    event_id,
+                    sorted(allowed_dates),
+                    len(contributions),
+                    before,
+                )
             
             for contribution in contributions:
                 # Create resource for contribution metadata
@@ -343,7 +412,7 @@ class IndicoScraper:
         if not self.conversion_enabled:
             logger.debug("Slide conversion disabled, skipping")
             return None
-        
+
         filename = attachment.get("filename", "")
         download_url = attachment.get("download_url", "")
         content_type = attachment.get("content_type", "")
@@ -372,7 +441,7 @@ class IndicoScraper:
             conversion_result = self.slide_converter.convert_bytes(
                 file_bytes,
                 content_type,
-                filename
+                filename,
             )
             
             if conversion_result.error:

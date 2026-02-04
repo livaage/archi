@@ -266,11 +266,14 @@ class TemplateManager:
                     logger.warning(f"Prompt file not found: {prompt_path}")
                     continue
 
-                target_path = base_dir / "data" / "prompts" / source_path.name
+                # Avoid collisions when multiple prompts share a common filename
+                # (e.g. "chat/default.prompt" and "condense/default.prompt").
+                target_filename = f"{prompt_key}-{source_path.name}"
+                target_path = base_dir / "data" / "prompts" / target_filename
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source_path, target_path)
 
-                prompt_mappings[prompt_key] = f"/root/archi/data/prompts/{source_path.name}"
+                prompt_mappings[prompt_key] = f"/root/archi/data/prompts/{target_filename}"
                 logger.debug(f"Copied prompt {prompt_key} to {target_path}")
 
         return prompt_mappings

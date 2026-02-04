@@ -16,11 +16,13 @@ data_manager:
       schedule: ''  # Leave empty for manual collection
       base_url: https://indico.cern.ch
       use_sso: false  # Set to true if scraping protected events
+      # Scrape only the first day of the event (based on event startDate)
+      only_first_day: true
       sso_kwargs:
         headless: true
         site_type: generic
       slide_conversion:
-        enabled: false  # Disabled until markitdown is added to base image
+        enabled: true
         store_originals: false  # Only store markdown
         formats:
           - pdf
@@ -100,54 +102,24 @@ services:
     distance_metric: cosine
 
   # Chat Interface (for testing RAG with Indico data)
-  chatbot:
-    enabled: true
-    external_port: 5000
+  chat_app:
+    pipeline: QAPipeline
+    port: 7861
+    external_port: 7861
     host: 0.0.0.0
-    port: 5000
-    active_pipeline: conversational_rag
-    available_pipelines:
-      - conversational_rag
-      - simple_rag
-    
-    # Models
-    active_model: gpt-4o-mini  # Change to your preferred model
-    available_models:
-      - gpt-4o-mini
-      - gpt-4o
-      - gpt-4-turbo
-    
-    # Generation parameters
-    temperature: 0.7
-    max_tokens: 2048
-    top_p: 0.95
-    top_k: 40
-    
-    # Retrieval
-    num_documents_to_retrieve: 5
-    
-    # Prompts
-    active_condense_prompt: default
-    active_chat_prompt: default
-    active_system_prompt: default
-    
-    # Features
-    enable_conversation_history: true
-    max_history_length: 10
-    enable_sources_display: true
-    enable_feedback: true
-    
-    # Security
-    require_login: false  # Set to true for production
-    allowed_domains: []
-    
-    verbosity: info
+    hostname: localhost
+    flask_debug_mode: false
+    auth:
+      enabled: false
 
   # Data Manager (required for ingestion)
   data_manager:
     enabled: true
     port: 8001
+    external_port: 7871
     schedule_enabled: false  # Disable scheduled runs for testing
+    auth:
+      enabled: false
 
   # Uploader (optional - for adding documents via UI)
   uploader:
@@ -187,19 +159,15 @@ archi:
           chat_prompt: prompts/chat/default.prompt
       models:
         required:
-          condense_model: OpenAIGPT35
-          chat_model: OpenAIGPT4
+          condense_model: OllamaInterface
+          chat_model: OllamaInterface
   model_class_map:
-    OpenAIGPT4:
-      class: OpenAILLM
+    OllamaInterface:
+      class: OllamaInterface
       kwargs:
-        model_name: gpt-4o-mini
-        temperature: 1
-    OpenAIGPT35:
-      class: OpenAILLM
-      kwargs:
-        model_name: gpt-3.5-turbo
-        temperature: 1
+        base_model: llama3.2
+        url: http://host.docker.internal:11434
+        temperature: 0.7
 
 # === LOGGING ===
 logging:

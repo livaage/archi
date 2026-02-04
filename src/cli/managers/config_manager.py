@@ -172,7 +172,18 @@ class ConfigurationManager:
             links_section = sources_section.get('links', {}) if isinstance(sources_section, dict) else {}
             lists = links_section.get('input_lists') or []
             if isinstance(lists, list):
-                collected.extend(lists)
+                conf_dir: Optional[Path] = None
+                conf_path = conf.get("_config_path")
+                if conf_path:
+                    conf_dir = Path(conf_path).expanduser().parent
+
+                for entry in lists:
+                    if not entry:
+                        continue
+                    p = Path(str(entry)).expanduser()
+                    if not p.is_absolute() and conf_dir:
+                        p = (conf_dir / p).resolve()
+                    collected.append(str(p))
         self.input_list = sorted(set(collected)) if collected else []
 
     def get_enabled_sources(self) -> List[str]:
