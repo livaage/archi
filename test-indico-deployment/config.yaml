@@ -75,22 +75,30 @@ data_manager:
       url: ''
       project: ''
   
-  # === VECTOR STORE CONFIGURATION ===
-  vectorstore:
-    provider: chroma  # or 'postgres' if you prefer
-    reset_store: true  # Fresh start for testing
-    model_name: sentence-transformers/all-MiniLM-L6-v2
-    model_kwargs:
-      device: cpu
-    encode_kwargs:
-      normalize_embeddings: true
-    chunk_size: 1000
-    chunk_overlap: 200
-    enable_stemming: false
-    distance_metric: cosine
+  # === EMBEDDING & CHUNKING CONFIGURATION ===
+  # Note: Vectorstore is now Postgres-only (Chroma was removed upstream)
+  collection_name: indico_test_collection
+  embedding_name: HuggingFaceEmbeddings
+  reset_collection: true  # Fresh start for testing
+  chunk_size: 1000
+  chunk_overlap: 200
+  distance_metric: cosine
+  stemming:
+    enabled: false
 
 # === SERVICES CONFIGURATION ===
 services:
+  # PostgreSQL (required - now the only vectorstore backend)
+  postgres:
+    port: 5432
+    user: archi
+    database: archi-db
+  
+  # Vectorstore settings (Postgres with pgvector)
+  vectorstore:
+    backend: postgres
+    distance_metric: cosine
+
   # Chat Interface (for testing RAG with Indico data)
   chatbot:
     enabled: true
@@ -165,8 +173,8 @@ services:
   benchmark:
     enabled: false
 
-# === A2RCHI CORE CONFIGURATION ===
-a2rchi:
+# === ARCHI CORE CONFIGURATION ===
+archi:
   pipelines:
     - QAPipeline
   agent_description: "Indico events and slides knowledge base"
