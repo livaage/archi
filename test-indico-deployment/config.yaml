@@ -15,7 +15,7 @@ data_manager:
       visible: true
       schedule: ''  # Leave empty for manual collection
       base_url: https://indico.cern.ch
-      use_sso: true  # Enable SSO for protected events
+      use_sso: false  # Set true + provide authorized credentials for protected events
       # Day filtering: max_days limits to first N days of event
       max_days: 1
       sso_kwargs:
