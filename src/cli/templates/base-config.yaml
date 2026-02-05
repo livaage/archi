@@ -211,6 +211,19 @@ data_manager:
       schedule: '{{ data_manager.sources.indico.schedule | default("", true) }}'
       base_url: {{ data_manager.sources.indico.base_url | default('https://indico.cern.ch', true) }}
       use_sso: {{ data_manager.sources.indico.use_sso | default(true) }}
+      # Day filtering (all optional - if none set, scrapes all days)
+      {%- if data_manager.sources.indico.max_days is defined %}
+      max_days: {{ data_manager.sources.indico.max_days }}
+      {%- endif %}
+      {%- if data_manager.sources.indico.only_first_day is defined %}
+      only_first_day: {{ data_manager.sources.indico.only_first_day }}
+      {%- endif %}
+      {%- if data_manager.sources.indico.days is defined %}
+      days: {{ data_manager.sources.indico.days | tojson }}
+      {%- endif %}
+      {%- if data_manager.sources.indico.date_range is defined %}
+      date_range: {{ data_manager.sources.indico.date_range | tojson }}
+      {%- endif %}
       sso_kwargs:
         headless: {{ data_manager.sources.indico.sso_kwargs.headless | default(true, true) }}
         site_type: {{ data_manager.sources.indico.sso_kwargs.site_type | default('generic', true) }}

@@ -236,7 +236,7 @@ CREATE TABLE IF NOT EXISTS documents (
     is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
     deleted_at TIMESTAMP,
     
-    CONSTRAINT valid_source CHECK (source_type IN ('local_files', 'web', 'ticket', 'git', 'sso', 'unknown'))
+    CONSTRAINT valid_source CHECK (source_type IN ('local_files', 'web', 'ticket', 'git', 'sso', 'indico', 'unknown'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(resource_hash);

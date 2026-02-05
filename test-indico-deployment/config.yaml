@@ -15,9 +15,9 @@ data_manager:
       visible: true
       schedule: ''  # Leave empty for manual collection
       base_url: https://indico.cern.ch
-      use_sso: false  # Set to true if scraping protected events
-      # Scrape only the first day of the event (based on event startDate)
-      only_first_day: true
+      use_sso: true  # Enable SSO for protected events
+      # Day filtering: max_days limits to first N days of event
+      max_days: 1
       sso_kwargs:
         headless: true
         site_type: generic
@@ -159,14 +159,13 @@ archi:
           chat_prompt: prompts/chat/default.prompt
       models:
         required:
-          condense_model: OllamaInterface
-          chat_model: OllamaInterface
+          condense_model: OpenAILLM
+          chat_model: OpenAILLM
   model_class_map:
-    OllamaInterface:
-      class: OllamaInterface
+    OpenAILLM:
+      class: OpenAILLM
       kwargs:
-        base_model: llama3.2
-        url: http://host.docker.internal:11434
+        model_name: gpt-4o-mini
         temperature: 0.7
 
 # === LOGGING ===

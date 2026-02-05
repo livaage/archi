@@ -256,6 +256,8 @@ class VectorStoreManager:
 
             for index, split_doc in enumerate(split_docs):
                 chunk = split_doc.page_content or ""
+                # Remove NUL bytes that can come from PDF/PPTX conversion
+                chunk = chunk.replace("\x00", "")
                 if apply_stemming:
                     words = tokenize(chunk)
                     chunk = " ".join(stem(word) for word in words)

@@ -81,20 +81,37 @@ class IndicoScraper:
             return []
 
         resources: List[ScrapedResource] = []
+        authenticated_session = None
         
         try:
-            # Set up authenticated session if SSO is enabled
-            session = self._setup_authenticated_session(event_urls[0])
-            
             for url in event_urls:
                 try:
                     if "/event/" in url:
                         event_id = self._extract_event_id(url)
                         if event_id:
+                            # Auto-detect if authentication is needed
+                            needs_auth = self._check_event_requires_auth(event_id)
+                            
+                            if needs_auth and self.use_sso:
+                                # Set up authenticated session (reuse if already created)
+                                if authenticated_session is None:
+                                    authenticated_session = self._setup_authenticated_session(url)
+                                session = authenticated_session
+                            elif needs_auth and not self.use_sso:
+                                logger.warning(f"Event {event_id} requires authentication but use_sso=False; skipping")
+                                continue
+                            else:
+                                # Public event - use unauthenticated session
+                                session = requests.Session()
+                            
                             resources.extend(self._collect_event(event_id, session))
                     elif "/category/" in url:
                         category_id = self._extract_category_id(url)
                         if category_id:
+                            # Categories often require auth, use authenticated session if available
+                            if self.use_sso and authenticated_session is None:
+                                authenticated_session = self._setup_authenticated_session(url)
+                            session = authenticated_session if authenticated_session else requests.Session()
                             resources.extend(self._collect_category(category_id, session))
                     else:
                         logger.warning(f"Unrecognized Indico URL format: {url}")
@@ -161,6 +178,70 @@ class IndicoScraper:
 
         return None
 
+    def _check_event_requires_auth(self, event_id: str) -> bool:
+        """Check if an event requires authentication by trying an unauthenticated request.
+        
+        Indico returns empty results for protected events rather than 401/403,
+        so we check for actual content in the response.
+        
+        Args:
+            event_id: Event ID to check
+            
+        Returns:
+            True if authentication is required, False if public
+        """
+        test_url = f"{self.base_url}/export/event/{event_id}.json"
+        try:
+            response = requests.get(test_url, timeout=10, allow_redirects=False)
+            
+            # Public events return 200 with JSON data containing results
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    results = data.get("results", [])
+                    
+                    # Protected events return {"results": []} - empty array
+                    # Public events return {"results": [{event_data}]}
+                    if isinstance(results, list) and len(results) > 0:
+                        # Check the first result has actual content
+                        first_result = results[0]
+                        if first_result.get("title") or first_result.get("id"):
+                            logger.info(f"Event {event_id} is public (no auth required)")
+                            return False
+                    
+                    # Empty results = protected event
+                    if data.get("count", 1) == 0 or not results:
+                        logger.info(f"Event {event_id} requires authentication (empty results)")
+                        return True
+                        
+                except ValueError:
+                    pass  # Not JSON, probably needs auth
+            
+            # Check for auth redirects or forbidden responses
+            if response.status_code in [401, 403]:
+                logger.info(f"Event {event_id} requires authentication (got {response.status_code})")
+                return True
+            
+            # Redirect to login page indicates auth required
+            if response.status_code in [301, 302, 303, 307, 308]:
+                location = response.headers.get("Location", "")
+                if "login" in location.lower() or "sso" in location.lower() or "auth" in location.lower():
+                    logger.info(f"Event {event_id} requires authentication (redirect to login)")
+                    return True
+            
+            # If we get here with non-200, assume auth might be needed
+            if response.status_code != 200:
+                logger.info(f"Event {event_id} status {response.status_code}, assuming auth required")
+                return True
+                
+            # Default: assume auth required for safety
+            logger.info(f"Event {event_id} - unclear status, assuming auth required")
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Error checking auth for event {event_id}: {e}, assuming auth required")
+            return True
+
     def _setup_authenticated_session(self, initial_url: str) -> requests.Session:
         """Set up an authenticated session using CERNSSOScraper.
         
@@ -182,8 +263,21 @@ class IndicoScraper:
                 
                 if cookies:
                     for cookie in cookies:
-                        session.cookies.set(cookie['name'], cookie['value'])
-                    logger.info("Successfully authenticated with CERN SSO")
+                        # Transfer all cookie attributes including domain
+                        # Strip leading dot from domain if present (requests handles this)
+                        domain = cookie.get('domain', '')
+                        if domain.startswith('.'):
+                            domain = domain[1:]  # Remove leading dot
+                        
+                        session.cookies.set(
+                            cookie['name'],
+                            cookie['value'],
+                            domain=domain,
+                            path=cookie.get('path', '/'),
+                            secure=cookie.get('secure', False),
+                        )
+                        logger.debug(f"Set cookie: {cookie['name']} for domain {domain}")
+                    logger.info(f"Successfully authenticated with CERN SSO ({len(cookies)} cookies)")
                 else:
                     logger.warning("Authentication did not return cookies")
                     
@@ -319,6 +413,9 @@ class IndicoScraper:
     def _fetch_contributions(self, event_id: str, session: requests.Session) -> List[Dict]:
         """Fetch all contributions (talks) for an event.
         
+        First tries the JSON API. If that returns 0 contributions,
+        falls back to scraping the timetable HTML view.
+        
         Args:
             event_id: Event ID
             session: Authenticated session
@@ -326,6 +423,18 @@ class IndicoScraper:
         Returns:
             List of contribution dictionaries
         """
+        # Try the standard API first
+        contributions = self._fetch_contributions_from_api(event_id, session)
+        
+        # Fallback to timetable scraping if API returns nothing
+        if not contributions:
+            logger.info(f"No contributions from API for event {event_id}, trying timetable view...")
+            contributions = self._fetch_contributions_from_timetable(event_id, session)
+        
+        return contributions
+
+    def _fetch_contributions_from_api(self, event_id: str, session: requests.Session) -> List[Dict]:
+        """Fetch contributions from the JSON API endpoint."""
         try:
             url = f"{self.base_url}/export/event/{event_id}.json?detail=contributions"
             logger.info(f"Fetching contributions: {url}")
@@ -339,13 +448,123 @@ class IndicoScraper:
                 contributions = results[0].get("contributions", [])
             else:
                 contributions = []
-            logger.info(f"Found {len(contributions)} contributions for event {event_id}")
+            logger.info(f"Found {len(contributions)} contributions from API for event {event_id}")
             
             return contributions
             
         except Exception as e:
-            logger.error(f"Error fetching contributions for event {event_id}: {e}")
+            logger.error(f"Error fetching contributions from API for event {event_id}: {e}")
             return []
+
+    def _fetch_contributions_from_timetable(self, event_id: str, session: requests.Session) -> List[Dict]:
+        """Fallback: scrape contributions from the timetable HTML view.
+        
+        Some Indico events structure content in timetable sessions rather than
+        direct contributions. This scrapes the timetable page to extract them.
+        Uses Selenium if available for authenticated access.
+        """
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            logger.warning("BeautifulSoup not available; cannot scrape timetable HTML")
+            return []
+        
+        contributions = []
+        html_content = None
+        
+        # Try Selenium first if SSO scraper is available (better for authenticated pages)
+        if self.sso_scraper and self.sso_scraper.driver:
+            timetable_url = f"{self.base_url}/event/{event_id}/timetable/#all.detailed"
+            logger.info(f"Fetching timetable via Selenium: {timetable_url}")
+            try:
+                self.sso_scraper.driver.get(timetable_url)
+                import time
+                time.sleep(2)  # Wait for JavaScript to render
+                html_content = self.sso_scraper.driver.page_source
+            except Exception as e:
+                logger.warning(f"Selenium timetable fetch failed: {e}")
+        
+        # Fallback to requests if Selenium didn't work
+        if not html_content:
+            timetable_urls = [
+                f"{self.base_url}/event/{event_id}/timetable/",
+                f"{self.base_url}/event/{event_id}/",
+            ]
+            
+            for timetable_url in timetable_urls:
+                logger.info(f"Fetching timetable via requests: {timetable_url}")
+                try:
+                    response = session.get(timetable_url, timeout=30)
+                    response.raise_for_status()
+                    html_content = response.text
+                    break
+                except Exception as e:
+                    logger.warning(f"Error fetching timetable from {timetable_url}: {e}")
+                    continue
+        
+        if not html_content:
+            logger.warning(f"Could not fetch timetable for event {event_id}")
+            return []
+        
+        # Parse the HTML
+        try:
+            soup = BeautifulSoup(html_content, "html.parser")
+                
+            # Look for contribution links (most reliable pattern)
+            contrib_links = soup.select('a[href*="/contribution/"]')
+            for link in contrib_links:
+                href = link.get("href", "")
+                if "/contribution/" in href:
+                    parts = href.split("/contribution/")
+                    if len(parts) > 1:
+                        contrib_id = parts[1].split("/")[0].split("?")[0]
+                        if contrib_id and contrib_id.isdigit():
+                            title = link.get_text(strip=True) or f"Contribution {contrib_id}"
+                            contributions.append({
+                                "id": contrib_id,
+                                "title": title,
+                                "_from_timetable": True,
+                                "folders": [],
+                            })
+            
+            # Look for direct material links (PDF, PPTX, etc.)
+            file_extensions = [".pdf", ".pptx", ".ppt", ".odp", ".doc", ".docx"]
+            all_links = soup.select('a[href]')
+            for link in all_links:
+                href = link.get("href", "")
+                filename = link.get_text(strip=True)
+                
+                # Check if it's a material link
+                is_material = (
+                    any(href.lower().endswith(ext) for ext in file_extensions) or
+                    "/attachments/" in href or
+                    "/material/" in href
+                )
+                
+                if is_material and filename:
+                    full_url = href if href.startswith("http") else f"{self.base_url}{href}"
+                    contributions.append({
+                        "id": f"material_{hash(full_url) % 100000}",
+                        "title": filename,
+                        "_from_timetable": True,
+                        "_direct_material_url": full_url,
+                        "folders": [],
+                    })
+                    
+        except Exception as e:
+            logger.error(f"Error parsing timetable HTML for event {event_id}: {e}")
+        
+        # Deduplicate by ID and URL
+        seen = set()
+        unique_contributions = []
+        for c in contributions:
+            key = c.get("_direct_material_url") or c.get("id")
+            if key and key not in seen:
+                seen.add(key)
+                unique_contributions.append(c)
+        
+        logger.info(f"Found {len(unique_contributions)} contributions from timetable for event {event_id}")
+        return unique_contributions
 
     def _collect_materials(
         self,
@@ -366,6 +585,32 @@ class IndicoScraper:
         resources: List[ScrapedResource] = []
         
         contribution_id = str(contribution.get("id", ""))
+        
+        # Handle direct material URLs from timetable scraping
+        direct_url = contribution.get("_direct_material_url")
+        if direct_url:
+            try:
+                # Create a synthetic attachment for the direct URL
+                filename = direct_url.split("/")[-1].split("?")[0]
+                attachment = {
+                    "download_url": direct_url,
+                    "filename": filename,
+                    "title": contribution.get("title", filename),
+                }
+                resource = self._download_and_convert_material(
+                    event_id,
+                    contribution_id,
+                    contribution,
+                    attachment,
+                    session
+                )
+                if resource:
+                    resources.append(resource)
+            except Exception as e:
+                logger.error(f"Error processing direct material URL: {e}")
+            return resources
+        
+        # Standard API flow: process folders and attachments
         folders = contribution.get("folders", [])
         
         for folder in folders:
