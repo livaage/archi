@@ -159,14 +159,18 @@ archi:
           chat_prompt: prompts/chat/default.prompt
       models:
         required:
-          condense_model: OpenAILLM
-          chat_model: OpenAILLM
+          condense_model: OllamaInterface
+          chat_model: OllamaInterface
+  # Ollama: use url (not base_url) and base_model so template + code match.
+  # For Docker, chatbot must reach host Ollama via host.docker.internal:11434.
   model_class_map:
-    OpenAILLM:
-      class: OpenAILLM
+    OllamaInterface:
+      class: OllamaInterface
       kwargs:
-        model_name: gpt-4o-mini
+        base_model: llama3.2
+        url: http://host.docker.internal:11434
         temperature: 0.7
+        max_tokens: 4000
 
 # === LOGGING ===
 logging:

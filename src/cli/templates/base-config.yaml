@@ -410,9 +410,10 @@ archi:
     OllamaInterface:
       class: OllamaInterface
       kwargs:
-        base_model: {{ archi.model_class_map.OllamaInterface.kwargs.base_model | default("gemma3", true) }}
-        temperature: {{ archi.model_class_map.OllamaInterface.kwargs.temperature | default(1, true) }}
-        max_tokens: {{ archi.model_class_map.OllamaInterface.kwargs.max_tokens | default(1000, true) }}
-        url: {{ archi.model_class_map.OllamaInterface.kwargs.url | default("http://localhost:7870", true) }}
+        base_model: {{ archi.model_class_map.OllamaInterface.kwargs.base_model | default("llama3.2", true) }}
+        temperature: {{ archi.model_class_map.OllamaInterface.kwargs.temperature | default(0.7, true) }}
+        max_tokens: {{ archi.model_class_map.OllamaInterface.kwargs.max_tokens | default(4000, true) }}
+        {# In Docker, chatbot must reach host Ollama via host.docker.internal; on host use localhost #}
+        url: {{ archi.model_class_map.OllamaInterface.kwargs.url | default('http://host.docker.internal:11434' if not host_mode else 'http://localhost:11434', true) }}
   chain_update_time: {{ archi.chain_update_time | default(10, true) }}
   mcp_servers: {{ archi.mcp_servers | default({}, true) }}
